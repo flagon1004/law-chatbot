@@ -42,12 +42,6 @@ SYSTEM_PROMPT = """당신은 대한민국 법령 전문 AI 어시스턴트입니
 6. [법제처 법령 데이터]에 제공된 조문 원문은 화면에 별도로 표시되므로, 답변에 원문을 그대로 옮겨 적지 마세요.
    대신 "제O조에 따르면 ~하다"처럼 조문 번호를 근거로 그 의미와 적용 결과를 해설·요약하세요."""
 
-LAW_KEYWORDS = [
-    "법", "조", "항", "호", "시행령", "시행규칙", "법률", "규정", "조항",
-    "처벌", "과태료", "벌금", "허가", "신고", "의무", "금지", "제한"
-]
-
-
 class Message(BaseModel):
     role: str
     content: str
@@ -125,15 +119,14 @@ async def chat(req: ChatRequest):
 
     await asyncio.sleep(1)
 
-    legal_basis  = []
-    precedents   = []
-    law_used     = False
-
-    if any(kw in req.message for kw in LAW_KEYWORDS):
-        # 조문 전문까지 조회
-        legal_basis = await search_and_fetch_law(req.message)
-        precedents  = await search_precedent(req.message)
-        law_used    = bool(legal_basis or precedents)
+    # 법령 키워드 유무와 무관하게 항상 조회를 시도한다.
+    # (민법/상법 관련 질문 등은 "법", "조" 같은 키워드 없이도 들어올 수 있고,
+    #  검색 실패 시 빈 리스트를 반환하므로 항상 시도해도 안전하다.)
+    legal_basis, precedents = await asyncio.gather(
+        search_and_fetch_law(req.message),
+        search_precedent(req.message),
+    )
+    law_used = bool(legal_basis or precedents)
 
     prompt = build_prompt(
         req.message, req.history,
