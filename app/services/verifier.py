@@ -1,11 +1,11 @@
 import re
 
-async def verify_citations(reply: str, law_context: str) -> str:
+async def verify_citations(reply: str, legal_basis: list) -> str:
     """
-    AI 답변의 조문 번호를 실제 조문 전문과 교차 검증.
-    조문 전문에 없는 번호가 인용되면 경고 문구 추가.
+    AI 답변의 조문 번호를 실제 조문 리스트(legal_basis)와 교차 검증.
+    조문 리스트에 없는 번호가 인용되면 경고 문구 추가.
     """
-    if not law_context:
+    if not legal_basis:
         return reply
 
     # 답변에서 "제XX조" 패턴 추출
@@ -13,8 +13,8 @@ async def verify_citations(reply: str, law_context: str) -> str:
     if not cited:
         return reply
 
-    # 실제 조문 전문에 존재하는 조문 번호 목록
-    actual = set(re.findall(r"제(\d+)조", law_context))
+    # 실제 조문 리스트에 존재하는 조문 번호 목록
+    actual = {str(item["article_no"]) for item in legal_basis}
 
     # 불일치 조문 탐지
     unverified = [n for n in cited if n not in actual]

@@ -6,7 +6,10 @@ from typing import List, Dict, Optional
 import asyncio
 from app.services.gemini import ask_gemini
 from app.services.nvidia import ask_nvidia
-from app.services.law_api import search_and_fetch_law, search_precedent
+from app.services.law_api import (
+    search_and_fetch_law, search_precedent,
+    format_legal_basis, format_precedents,
+)
 from app.services.verifier import verify_citations
 
 router = APIRouter()
@@ -35,7 +38,9 @@ SYSTEM_PROMPT = """당신은 대한민국 법령 전문 AI 어시스턴트입니
 2. 판례는 반드시 아래 [법제처 실제 판례] 섹션에 제공된 것만 인용하세요.
 3. 제공된 판례가 없으면 "관련 판례를 찾지 못했습니다"라고 명시하세요.
 4. 판례번호, 선고일자, 법원명을 절대 임의로 생성하지 마세요.
-5. 모르는 내용은 추측하지 말고 법령 확인을 권고하세요."""
+5. 모르는 내용은 추측하지 말고 법령 확인을 권고하세요.
+6. [법제처 법령 데이터]에 제공된 조문 원문은 화면에 별도로 표시되므로, 답변에 원문을 그대로 옮겨 적지 마세요.
+   대신 "제O조에 따르면 ~하다"처럼 조문 번호를 근거로 그 의미와 적용 결과를 해설·요약하세요."""
 
 LAW_KEYWORDS = [
     "법", "조", "항", "호", "시행령", "시행규칙", "법률", "규정", "조항",
@@ -55,10 +60,27 @@ class ChatRequest(BaseModel):
     admin_password: Optional[str] = None
 
 
+class LegalBasisItem(BaseModel):
+    law_name: str
+    date: str
+    article_no: str
+    text: str
+
+
+class PrecedentItem(BaseModel):
+    court: str
+    date: str
+    case_no: str
+    case_name: str
+    summary: str = ""
+
+
 class ChatResponse(BaseModel):
     reply: str
     law_context_used: bool = False
     denied: bool = False
+    legal_basis: List[LegalBasisItem] = []
+    precedents: List[PrecedentItem] = []
 
 
 class AdminVerifyRequest(BaseModel):
@@ -103,21 +125,29 @@ async def chat(req: ChatRequest):
 
     await asyncio.sleep(1)
 
-    law_context  = ""
-    prec_context = ""
+    legal_basis  = []
+    precedents   = []
     law_used     = False
 
     if any(kw in req.message for kw in LAW_KEYWORDS):
         # 조문 전문까지 조회
-        law_context  = await search_and_fetch_law(req.message)
-        prec_context = await search_precedent(req.message)
-        law_used     = bool(law_context or prec_context)
+        legal_basis = await search_and_fetch_law(req.message)
+        precedents  = await search_precedent(req.message)
+        law_used    = bool(legal_basis or precedents)
 
-    prompt = build_prompt(req.message, req.history, law_context, prec_context)
+    prompt = build_prompt(
+        req.message, req.history,
+        format_legal_basis(legal_basis), format_precedents(precedents),
+    )
     ask_model = MODEL_PROVIDERS.get(req.model, ask_gemini)
     reply  = await ask_model(prompt)
 
     # 인용 검증 — 조문 번호 오류 탐지
-    reply = await verify_citations(reply, law_context)
+    reply = await verify_citations(reply, legal_basis)
 
-    return ChatResponse(reply=reply, law_context_used=law_used)
+    return ChatResponse(
+        reply=reply,
+        law_context_used=law_used,
+        legal_basis=legal_basis,
+        precedents=precedents,
+    )

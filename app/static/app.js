@@ -106,14 +106,14 @@ function loadSession(id) {
   const messages = document.getElementById("messages");
   messages.innerHTML = "";
   session.messages.forEach(m => {
-    appendBubble(m.role, m.text, m.lawUsed || false, false);
+    appendBubble(m.role, m.text, m.lawUsed || false, false, m.legalBasis || [], m.precedents || []);
   });
   highlightActive(id);
 }
 
-function addMessageToSession(role, text, lawUsed = false) {
+function addMessageToSession(role, text, lawUsed = false, legalBasis = [], precedents = []) {
   if (!currentSession) createSession();
-  currentSession.messages.push({ role, text, lawUsed });
+  currentSession.messages.push({ role, text, lawUsed, legalBasis, precedents });
 
   // 첫 사용자 메시지를 제목으로
   if (role === "user" && currentSession.title === "새 대화") {
@@ -177,12 +177,87 @@ function clearWelcome() {
   if (welcome) welcome.remove();
 }
 
-function appendBubble(role, text, lawUsed = false, save = true) {
+function buildLegalBasisBlock(legalBasis) {
+  const box = document.createElement("div");
+  box.className = "legal-basis-box";
+
+  const label = document.createElement("div");
+  label.className = "legal-basis-label";
+  label.textContent = "📖 법적 근거 (법제처 원문)";
+  box.appendChild(label);
+
+  // 법령별로 그룹화
+  const grouped = new Map();
+  legalBasis.forEach(item => {
+    const key = `${item.law_name} / 시행: ${item.date}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(item);
+  });
+
+  grouped.forEach((items, lawHeader) => {
+    const group = document.createElement("div");
+    group.className = "legal-basis-group";
+
+    const header = document.createElement("div");
+    header.className = "legal-basis-law";
+    header.textContent = lawHeader;
+    group.appendChild(header);
+
+    items.forEach(item => {
+      const article = document.createElement("div");
+      article.className = "legal-basis-article";
+      article.textContent = `제${item.article_no}조 ${item.text}`;
+      group.appendChild(article);
+    });
+
+    box.appendChild(group);
+  });
+
+  return box;
+}
+
+function buildPrecedentBlock(precedents) {
+  const box = document.createElement("div");
+  box.className = "legal-basis-box";
+
+  const label = document.createElement("div");
+  label.className = "legal-basis-label";
+  label.textContent = "⚖️ 참고 판례 (법제처 원문)";
+  box.appendChild(label);
+
+  precedents.forEach(p => {
+    const item = document.createElement("div");
+    item.className = "legal-basis-article";
+    item.textContent = `[${p.court} ${p.date} ${p.case_no}] ${p.case_name}`
+      + (p.summary ? ` — ${p.summary}...` : "");
+    box.appendChild(item);
+  });
+
+  return box;
+}
+
+function appendBubble(role, text, lawUsed = false, save = true, legalBasis = [], precedents = []) {
   clearWelcome();
   const messages = document.getElementById("messages");
 
   const wrap = document.createElement("div");
   wrap.className = `msg ${role}`;
+
+  if (role === "bot" && (legalBasis.length || precedents.length)) {
+    if (legalBasis.length) wrap.appendChild(buildLegalBasisBlock(legalBasis));
+    if (precedents.length) wrap.appendChild(buildPrecedentBlock(precedents));
+  }
+
+  const bubbleLabel = (role === "bot" && (legalBasis.length || precedents.length))
+    ? "💬 해석"
+    : null;
+
+  if (bubbleLabel) {
+    const interpLabel = document.createElement("div");
+    interpLabel.className = "interp-label";
+    interpLabel.textContent = bubbleLabel;
+    wrap.appendChild(interpLabel);
+  }
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
@@ -205,11 +280,11 @@ function appendBubble(role, text, lawUsed = false, save = true) {
   messages.appendChild(wrap);
   messages.scrollTop = messages.scrollHeight;
 
-  if (save) addMessageToSession(role, text, lawUsed);
+  if (save) addMessageToSession(role, text, lawUsed, legalBasis, precedents);
 }
 
-function appendMessage(role, text, lawUsed = false) {
-  appendBubble(role, text, lawUsed, true);
+function appendMessage(role, text, lawUsed = false, legalBasis = [], precedents = []) {
+  appendBubble(role, text, lawUsed, true, legalBasis, precedents);
 }
 
 function showTyping() {
@@ -271,7 +346,7 @@ async function sendMessage() {
     const data = await res.json();
 
     hideTyping();
-    appendMessage("bot", data.reply, data.law_context_used);
+    appendMessage("bot", data.reply, data.law_context_used, data.legal_basis || [], data.precedents || []);
 
     if (data.denied) {
       sessionStorage.removeItem(ADMIN_PW_STORAGE_KEY);
