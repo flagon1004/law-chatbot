@@ -4,6 +4,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import asyncio
+from app.services.intent import extract_search_keywords
 from app.services.gemini import ask_gemini
 from app.services.nvidia import ask_nvidia
 from app.services.law_api import (
@@ -118,13 +119,17 @@ async def chat(req: ChatRequest):
         )
 
     await asyncio.sleep(1)
-
+    # [신규] 의도 파악 및 검색 키워드 정제
+    search_query = await extract_search_keywords(req.message)
+    
     # 법령 키워드 유무와 무관하게 항상 조회를 시도한다.
     # (민법/상법 관련 질문 등은 "법", "조" 같은 키워드 없이도 들어올 수 있고,
     #  검색 실패 시 빈 리스트를 반환하므로 항상 시도해도 안전하다.)
+   
+    # [수정] 원본 req.message 대신 정제된 search_query로 API 검색 시도
     legal_basis, precedents = await asyncio.gather(
-        search_and_fetch_law(req.message),
-        search_precedent(req.message),
+        search_and_fetch_law(search_query),
+        search_precedent(search_query),
     )
     law_used = bool(legal_basis or precedents)
 
