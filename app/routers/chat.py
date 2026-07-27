@@ -104,6 +104,17 @@ def build_prompt(message: str, history: List[Message],
     return "".join(parts)
 
 
+async def _search_first_hit(search_fn, terms: List[str]):
+    """콤마로 분리된 후보 키워드를 하나씩 시도해 결과가 있는 첫 번째 것을 반환.
+    법제처 검색 API는 콤마로 묶인 다중 키워드 문자열은 매칭하지 못하고
+    (예: "금전소비대차, 대여금" -> 0건) 단일 키워드일 때만 매칭되기 때문."""
+    for term in terms:
+        result = await search_fn(term)
+        if result:
+            return result
+    return []
+
+
 @router.post("/admin/verify", response_model=AdminVerifyResponse)
 async def admin_verify(req: AdminVerifyRequest):
     return AdminVerifyResponse(ok=_check_admin_password(req.password))
@@ -119,17 +130,23 @@ async def chat(req: ChatRequest):
         )
 
     await asyncio.sleep(1)
-    # [신규] 의도 파악 및 검색 키워드 정제
-    search_query = await extract_search_keywords(req.message)
-    
+
+    # 사용자가 선택한 모델을 파이프라인 전체(키워드 추출 + 최종 답변)에서
+    # 일관되게 사용한다 — 여기서 결정을 미루면 검색어 추출 단계에서
+    # 사용자가 고르지 않은 모델(예: 관리자 잠금된 Gemini)이 매 요청마다
+    # 조용히 호출되는 문제가 생긴다.
+    ask_model = MODEL_PROVIDERS.get(req.model, ask_nvidia)
+
+    # 의도 파악 및 검색 키워드 정제 (선택된 모델로 수행)
+    search_query = await extract_search_keywords(req.message, ask_model)
+    search_terms = [t.strip() for t in search_query.split(",") if t.strip()] or [req.message]
+
     # 법령 키워드 유무와 무관하게 항상 조회를 시도한다.
     # (민법/상법 관련 질문 등은 "법", "조" 같은 키워드 없이도 들어올 수 있고,
     #  검색 실패 시 빈 리스트를 반환하므로 항상 시도해도 안전하다.)
-   
-    # [수정] 원본 req.message 대신 정제된 search_query로 API 검색 시도
     legal_basis, precedents = await asyncio.gather(
-        search_and_fetch_law(search_query),
-        search_precedent(search_query),
+        _search_first_hit(search_and_fetch_law, search_terms),
+        _search_first_hit(search_precedent, search_terms),
     )
     law_used = bool(legal_basis or precedents)
 
@@ -137,7 +154,6 @@ async def chat(req: ChatRequest):
         req.message, req.history,
         format_legal_basis(legal_basis), format_precedents(precedents),
     )
-    ask_model = MODEL_PROVIDERS.get(req.model, ask_gemini)
     reply  = await ask_model(prompt)
 
     # 인용 검증 — 조문 번호 오류 탐지

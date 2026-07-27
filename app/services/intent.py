@@ -1,5 +1,4 @@
 # app/services/intent.py
-from app.services.gemini import ask_gemini
 
 KEYWORD_EXTRACTION_PROMPT = """
 당신은 대한민국 법률 검색을 돕는 키워드 추출 전문가입니다.
@@ -22,10 +21,14 @@ KEYWORD_EXTRACTION_PROMPT = """
 출력:
 """
 
-async def extract_search_keywords(message: str) -> str:
+async def extract_search_keywords(message: str, ask_fn) -> str:
+    """검색 키워드 추출도 사용자가 선택한 모델(ask_fn)로 수행한다.
+    최종 답변 모델과 다른 모델을 여기서 쓰면, 사용자가 선택하지 않은
+    모델(예: 관리자 잠금이 걸린 Gemini)이 매 요청마다 조용히 호출되는
+    문제가 생기기 때문."""
     prompt = KEYWORD_EXTRACTION_PROMPT.format(message=message)
     try:
-        raw_keywords = await ask_gemini(prompt)
+        raw_keywords = await ask_fn(prompt)
         search_query = raw_keywords.strip().replace("\n", " ")
         return search_query
     except Exception:
