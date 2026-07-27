@@ -115,6 +115,26 @@ async def _search_first_hit(search_fn, terms: List[str]):
     return []
 
 
+async def _search_all_terms(search_fn, terms: List[str], cap: int = 40):
+    """모든 후보 키워드를 시도해 결과를 합쳐서 반환 (중복 제거).
+
+    _search_first_hit과 달리 첫 번째로 뭐라도 찾아지면 멈추지 않는다.
+    예: 키워드 목록이 ["국가를 당사자로 하는 계약에 관한 법률 시행령", "공동계약운용요령"]
+    일 때, 앞의 시행령이 총칙 개요만으로도 "결과 있음"으로 잡혀서 뒤의
+    진짜 관련 조문(공동계약운용요령)을 아예 못 보게 되는 걸 방지한다."""
+    seen = set()
+    combined = []
+    for term in terms:
+        result = await search_fn(term)
+        for item in result:
+            key = (item.get("law_name"), item.get("article_no"), item.get("text", "")[:50])
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(item)
+    return combined[:cap]
+
+
 @router.post("/admin/verify", response_model=AdminVerifyResponse)
 async def admin_verify(req: AdminVerifyRequest):
     return AdminVerifyResponse(ok=_check_admin_password(req.password))
@@ -145,7 +165,7 @@ async def chat(req: ChatRequest):
     # (민법/상법 관련 질문 등은 "법", "조" 같은 키워드 없이도 들어올 수 있고,
     #  검색 실패 시 빈 리스트를 반환하므로 항상 시도해도 안전하다.)
     legal_basis, precedents = await asyncio.gather(
-        _search_first_hit(search_and_fetch_law, search_terms),
+        _search_all_terms(search_and_fetch_law, search_terms),
         _search_first_hit(search_precedent, search_terms),
     )
     law_used = bool(legal_basis or precedents)

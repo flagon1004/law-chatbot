@@ -149,13 +149,17 @@ def format_precedents(precedents: list) -> str:
 
     return "\n".join(lines)
     
-async def get_law_articles(law_id: str, keywords: list = None) -> list:
-    """법령 ID로 실제 조문 전문 조회 (구조화된 리스트로 반환)
+async def get_law_articles(law_id: str, keywords: list = None) -> tuple:
+    """법령 ID로 실제 조문 전문 조회.
 
     법령 하나가 수백 개 조문을 가질 수 있어 전부 반환할 수 없으므로,
     keywords가 주어지면 조문 내용에 키워드가 포함된 조문을 우선 반환하고
     (예: "음주운전 처벌" → 제44조·제148조의2 등 실제 관련 조문),
     일치하는 조문이 없으면 총칙 등 앞부분 조문으로 개요를 제공한다.
+
+    Returns: (articles, matched) — matched는 keywords와 실제로 일치하는
+    조문을 찾았는지 여부. False면 총칙 개요로 대체된 것이므로, 호출자는
+    다른 후보(행정규칙 등)를 추가로 시도할지 판단할 수 있다.
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -171,7 +175,7 @@ async def get_law_articles(law_id: str, keywords: list = None) -> list:
 
             articles = _as_list(data.get("법령", {}).get("조문", {}).get("조문단위"))
             if not articles:
-                return []
+                return [], False
 
             parsed = []
             for article in articles:
@@ -185,18 +189,115 @@ async def get_law_articles(law_id: str, keywords: list = None) -> list:
             if keywords:
                 matched = [a for a in parsed if any(kw in a["text"] for kw in keywords)]
                 if matched:
-                    return matched[:12]
+                    return matched[:12], True
 
-            return parsed[:10]  # 키워드 매칭이 없으면 앞부분(총칙 등)으로 개요 제공
+            return parsed[:10], False  # 키워드 매칭이 없으면 앞부분(총칙 등)으로 개요 제공
 
     except Exception:
+        return [], False
+
+
+async def search_admrul(query: str) -> list:
+    """법제처 행정규칙(훈령·예규·고시) 검색.
+
+    "계약예규 공동계약운용요령"처럼 법률/시행령/시행규칙이 아니라
+    행정규칙으로 분류되는 문서는 target=law로는 절대 찾을 수 없고
+    target=admrul로 검색해야 한다."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            params = {
+                "OC": _get_api_key(),
+                "target": "admrul",
+                "type": "JSON",
+                "query": query,
+                "display": 2,
+            }
+            resp = await client.get(f"{LAW_API_BASE}/lawSearch.do", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            return _as_list(data.get("AdmRulSearch", {}).get("admrul"))
+    except Exception:
         return []
+
+
+async def get_admrul_articles(serial_no: str, keywords: list = None) -> tuple:
+    """행정규칙일련번호로 조문 전문 조회.
+
+    행정규칙 API는 법령 API와 응답 구조가 달라 "조문내용"이
+    {"조문번호","조문내용"} 딕셔너리가 아니라 "제1조(목적) ..." 형태의
+    평문 문자열 리스트로 온다. Returns: (articles, matched)."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            params = {
+                "OC": _get_api_key(),
+                "target": "admrul",
+                "type": "JSON",
+                "ID": serial_no,
+            }
+            resp = await client.get(f"{LAW_API_BASE}/lawService.do", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+            raw_articles = _as_list(data.get("AdmRulService", {}).get("조문내용"))
+
+            parsed = []
+            for text in raw_articles:
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                m = re.match(r"제(\d+)조", text)
+                parsed.append({"article_no": m.group(1) if m else "", "text": text[:300]})
+
+            if keywords:
+                matched = [a for a in parsed if any(kw in a["text"] for kw in keywords)]
+                if matched:
+                    return matched[:12], True
+
+            return parsed[:10], False
+
+    except Exception:
+        return [], False
+
+
+async def _search_and_fetch_admrul(law_query: str, keywords: list) -> tuple:
+    """Returns: (legal_basis, matched) — matched는 키워드와 실제 일치하는
+    조문을 찾았는지 여부."""
+    rules = await search_admrul(law_query)
+    if not rules:
+        return [], False
+
+    legal_basis = []
+    matched_any = False
+    for rule in rules[:2]:
+        serial_no = rule.get("행정규칙일련번호", "")
+        rule_name = rule.get("행정규칙명", "")
+        date      = rule.get("시행일자", "")
+        if not serial_no:
+            continue
+        articles, matched = await get_admrul_articles(serial_no, keywords)
+        if matched:
+            matched_any = True
+        for article in articles:
+            legal_basis.append({
+                "law_name": rule_name,
+                "date": date,
+                "article_no": article["article_no"],
+                "text": article["text"],
+            })
+
+    return legal_basis, matched_any
 
 
 async def search_and_fetch_law(query: str) -> list:
     """검색 → 상위 법령의 실제 조문까지 조회 (구조화된 리스트로 반환)
 
     반환 항목: {"law_name", "date", "article_no", "text"}
+
+    법률/시행령/시행규칙(target=law)과 행정규칙(훈령·예규·고시, target=admrul)을
+    모두 시도하고, 질문 키워드와 실제로 일치하는 조문을 찾은 쪽을 우선한다.
+    (예: "국가를 당사자로 하는 계약에 관한 법률 시행령"은 law target에서 바로
+    찾아지지만 총칙(제1~7조)만 걸리는 반면, "공동계약운용요령"은 admrul target
+    에서 실제로 관련된 조문이 걸리는 경우 — 먼저 찾아졌다는 이유만으로 총칙
+    개요를 우선시하면 안 된다.)
     """
     try:
         law_query = _extract_law_query(query)
@@ -215,27 +316,37 @@ async def search_and_fetch_law(query: str) -> list:
             resp.raise_for_status()
             data = resp.json()
             laws = _as_list(data.get("LawSearch", {}).get("law"))
-            if not laws:
-                return []
 
+        law_basis, law_matched = [], False
+        if laws:
             # 2단계: 상위 2개 법령의 조문 전문 조회 (키워드와 관련된 조문 우선)
-            legal_basis = []
             for law in laws[:2]:
                 law_id   = law.get("법령ID", "")
                 law_name = law.get("법령명한글", "")
                 date     = law.get("시행일자", "")
                 if not law_id:
                     continue
-                articles = await get_law_articles(law_id, keywords)
+                articles, matched = await get_law_articles(law_id, keywords)
+                if matched:
+                    law_matched = True
                 for article in articles:
-                    legal_basis.append({
+                    law_basis.append({
                         "law_name": law_name,
                         "date": date,
                         "article_no": article["article_no"],
                         "text": article["text"],
                     })
 
-            return legal_basis
+        if law_matched:
+            return law_basis
+
+        # 법령에서 키워드 매칭 조문을 못 찾았으면 행정규칙(훈령·예규·고시)도 시도
+        admrul_basis, admrul_matched = await _search_and_fetch_admrul(law_query, keywords)
+        if admrul_matched or (admrul_basis and not law_basis):
+            return admrul_basis
+
+        # 어느 쪽도 키워드 매칭은 없지만 개요라도 있으면 법령 쪽을 우선 반환
+        return law_basis or admrul_basis
 
     except Exception:
         return []
