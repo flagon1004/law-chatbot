@@ -164,8 +164,14 @@ async def chat(req: ChatRequest):
     # 법령 키워드 유무와 무관하게 항상 조회를 시도한다.
     # (민법/상법 관련 질문 등은 "법", "조" 같은 키워드 없이도 들어올 수 있고,
     #  검색 실패 시 빈 리스트를 반환하므로 항상 시도해도 안전하다.)
+    # search_and_fetch_law(term, concept_text)에서 concept_text는 항상 원본
+    # 질문 전체를 넘긴다 — term(법령명 등)은 "어느 문서를 검색할지"만 정하고,
+    # "그 문서의 어느 조문이 관련 있는지"는 원본 질문의 핵심 단어로 걸러야
+    # 질문자의 실제 의도(탈퇴, 동의 등)가 조문 선별에 반영된다.
     legal_basis, precedents = await asyncio.gather(
-        _search_all_terms(search_and_fetch_law, search_terms),
+        _search_all_terms(
+            lambda term: search_and_fetch_law(term, req.message), search_terms
+        ),
         _search_first_hit(search_precedent, search_terms),
     )
     law_used = bool(legal_basis or precedents)

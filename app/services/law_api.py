@@ -9,7 +9,10 @@ LAW_API_BASE = "https://www.law.go.kr/DRF"
 
 # 법제처 lawSearch API는 법령명 앞부분 일치(제목 검색)만 지원하므로,
 # 사용자 문장 전체를 그대로 보내면 매칭되지 않는다. 문장에서 법령명 패턴만 추출한다.
-_LAW_NAME_PATTERN = re.compile(r"[가-힣]{2,15}(?:법률|법령|시행령|시행규칙|법)")
+# 공백을 허용하는 이유: "건설산업 기본법"처럼 띄어쓰기가 섞여 들어오면
+# 공백 없는 패턴은 "기본법"처럼 너무 짧고 일반적인 조각만 잡아서
+# 전혀 다른 법("건강가정기본법" 등)이 걸리는 문제가 있었다.
+_LAW_NAME_PATTERN = re.compile(r"[가-힣][가-힣\s]{1,40}(?:법률|법령|시행령|시행규칙|법)")
 
 # 법령명을 제외한 나머지 단어에서 걸러낼 의미 없는 조사/상투어
 _FILLER_WORDS = {
@@ -19,8 +22,13 @@ _FILLER_WORDS = {
 
 
 def _extract_law_query(message: str) -> str:
-    match = _LAW_NAME_PATTERN.search(message)
-    return match.group() if match else message
+    # 여러 후보 중 가장 긴(=가장 구체적인) 매칭을 고른다. 예: "건설산업 기본법"에서
+    # "기본법"과 "건설산업 기본법" 둘 다 매칭 가능한데, 짧은 쪽을 고르면
+    # 전혀 다른 법이 검색되므로 항상 가장 긴 매칭을 우선한다.
+    matches = _LAW_NAME_PATTERN.findall(message)
+    if matches:
+        return max(matches, key=len).strip()
+    return message
 
 
 def _extract_keywords(message: str, law_query: str) -> list:
@@ -287,7 +295,7 @@ async def _search_and_fetch_admrul(law_query: str, keywords: list) -> tuple:
     return legal_basis, matched_any
 
 
-async def search_and_fetch_law(query: str) -> list:
+async def search_and_fetch_law(query: str, concept_text: str = None) -> list:
     """검색 → 상위 법령의 실제 조문까지 조회 (구조화된 리스트로 반환)
 
     반환 항목: {"law_name", "date", "article_no", "text"}
@@ -298,10 +306,17 @@ async def search_and_fetch_law(query: str) -> list:
     찾아지지만 총칙(제1~7조)만 걸리는 반면, "공동계약운용요령"은 admrul target
     에서 실제로 관련된 조문이 걸리는 경우 — 먼저 찾아졌다는 이유만으로 총칙
     개요를 우선시하면 안 된다.)
+
+    `query`는 "어느 법령/문서를 검색할지"를 정하는 좁은 검색어(주로 intent.py가
+    뽑은 법령명 하나)이고, `concept_text`는 "그 안에서 어느 조문이 관련 있는지"
+    를 가르는 키워드의 원천이다. 이 둘을 분리하지 않고 query 자체에서만
+    키워드를 뽑으면(예: query가 이미 법령명 그 자체라 뺄 게 없음), 질문자가
+    실제로 의도한 핵심 내용("탈퇴", "동의" 등)이 조문 선별에 전혀 반영되지
+    않고 매번 총칙 개요만 나오게 된다. concept_text가 없으면 query로 대체한다.
     """
     try:
         law_query = _extract_law_query(query)
-        keywords  = _extract_keywords(query, law_query)
+        keywords  = _extract_keywords(concept_text or query, law_query)
 
         async with httpx.AsyncClient(timeout=8.0) as client:
             # 1단계: 법령 검색
