@@ -261,7 +261,11 @@ function appendBubble(role, text, lawUsed = false, save = true, legalBasis = [],
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = text;
+  if (role === "bot" && window.marked && window.DOMPurify) {
+    bubble.innerHTML = DOMPurify.sanitize(marked.parse(text));
+  } else {
+    bubble.textContent = text;
+  }
 
   const meta = document.createElement("div");
   meta.className = "msg-meta";
