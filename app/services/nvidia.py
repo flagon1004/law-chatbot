@@ -26,7 +26,9 @@ async def ask_nvidia(prompt: str) -> str:
             temperature=1,
             top_p=0.95,
             max_tokens=16384,
-            extra_body={"chat_template_kwargs": {"enable_thinking": True}, "reasoning_budget": 16384},
+            # reasoning_budget(=vLLM thinking_token_budget)은 NVIDIA의 V2 model runner에서
+            # 아직 지원되지 않아 400 에러를 유발하므로 제거. enable_thinking만 유지.
+            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
         )
         return completion.choices[0].message.content
     except ValueError as e:
