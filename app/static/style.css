@@ -33,7 +33,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text-primar
 .sidebar-header { padding: 24px 20px 16px; border-bottom: 1px solid rgba(255,255,255,0.08); }
 .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .logo-icon {
-  width: 28px; height: 28px;
+  width: 56px; height: 28px;
   border-radius: 6px;
   object-fit: cover;
   display: inline-block;
