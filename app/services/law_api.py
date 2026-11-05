@@ -18,7 +18,19 @@ _LAW_NAME_PATTERN = re.compile(r"[가-힣][가-힣\s]{1,40}(?:법률|법령|시�
 _FILLER_WORDS = {
     "알려줘", "알려주세요", "조항", "어떻게", "되나요", "되나요?", "궁금해요",
     "무엇인가요", "뭔가요", "관련", "내용", "대해", "설명해줘", "정도",
+    "있나요", "있을까요", "있습니까", "할까요", "가능한가요",
 }
+
+# "제4조 삭제 <2020.4.7>"처럼 본문 없이 삭제 표시만 있는 조문
+_DELETED_ARTICLE = re.compile(r"제\d+조(?:의\d+)?\s*삭제")
+
+# 조문 1개당 프롬프트/화면에 싣는 최대 글자 수. 항·호·목까지 포함한 전체 본문을
+# 매칭에는 쓰되, 출력은 이 길이로 자른다.
+_ARTICLE_TEXT_LIMIT = 800
+# 키워드와 일치하는 조문은 일치 키워드 수가 많은 순으로 문서당 이만큼만 싣는다.
+_MATCHED_LIMIT = 8
+# 키워드 일치가 없을 때 총칙 위주로 보여주는 개요 조문 수.
+_OVERVIEW_LIMIT = 6
 
 
 def _extract_law_query(message: str) -> str:
@@ -40,6 +52,57 @@ def _extract_keywords(message: str, law_query: str) -> list:
 
 def _get_api_key() -> str:
     return os.getenv("LAW_API_KEY", "demo")
+
+
+def _flatten_text(value) -> str:
+    """항내용/호내용/목내용은 문자열이거나 문자열 리스트로 온다."""
+    if isinstance(value, list):
+        return " ".join(str(v).strip() for v in value if v)
+    return str(value).strip() if value else ""
+
+
+def _article_full_text(article: dict) -> str:
+    """조문 제목(조문내용)에 항 → 호 → 목 본문을 이어 붙인 전체 본문.
+
+    법령 API의 '조문내용'은 많은 조문에서 제목("제44조(술에 취한 상태에서의
+    운전 금지)")뿐이고 실제 내용은 중첩된 항/호/목 필드에 들어 있다."""
+    lines = [_flatten_text(article.get("조문내용"))]
+    for hang in _as_list(article.get("항")):
+        if not isinstance(hang, dict):
+            lines.append(_flatten_text(hang))
+            continue
+        lines.append(_flatten_text(hang.get("항내용")))
+        for ho in _as_list(hang.get("호")):
+            if not isinstance(ho, dict):
+                lines.append(_flatten_text(ho))
+                continue
+            lines.append("  " + _flatten_text(ho.get("호내용")))
+            for mok in _as_list(ho.get("목")):
+                text = mok.get("목내용") if isinstance(mok, dict) else mok
+                lines.append("    " + _flatten_text(text))
+    return "\n".join(line for line in lines if line.strip())
+
+
+def _select_articles(parsed: list, keywords: list) -> tuple:
+    """전체 본문(parsed[i]["text"]) 기준으로 조문을 고른다.
+
+    Returns: (articles, matched). 키워드가 하나라도 일치하면 일치한 키워드 수가
+    많은 조문부터 _MATCHED_LIMIT개, 없으면 앞쪽 _OVERVIEW_LIMIT개(개요).
+    반환하는 text는 _ARTICLE_TEXT_LIMIT자로 자른다."""
+    def clip(a):
+        text = a["text"]
+        if len(text) > _ARTICLE_TEXT_LIMIT:
+            text = text[:_ARTICLE_TEXT_LIMIT] + "…"
+        return {"article_no": a["article_no"], "text": text}
+
+    if keywords:
+        scored = [(sum(1 for kw in keywords if kw in a["text"]), i, a)
+                  for i, a in enumerate(parsed)]
+        hits = sorted((s for s in scored if s[0] > 0), key=lambda s: (-s[0], s[1]))
+        if hits:
+            return [clip(a) for _, _, a in hits[:_MATCHED_LIMIT]], True
+
+    return [clip(a) for a in parsed[:_OVERVIEW_LIMIT]], False
 
 
 def _as_list(value):
@@ -189,17 +252,15 @@ async def get_law_articles(law_id: str, keywords: list = None) -> tuple:
             for article in articles:
                 if not isinstance(article, dict):
                     continue
-                jo_num  = article.get("조문번호", "")
-                jo_cont = article.get("조문내용", "")
-                if jo_num and jo_cont:
-                    parsed.append({"article_no": jo_num, "text": jo_cont[:300]})
+                # '전문'(장·절 제목) 단위는 조문 내용이 없으므로 제외
+                if article.get("조문여부", "조문") != "조문":
+                    continue
+                jo_num = article.get("조문번호", "")
+                text   = _article_full_text(article)
+                if jo_num and text and not _DELETED_ARTICLE.match(text):
+                    parsed.append({"article_no": jo_num, "text": text})
 
-            if keywords:
-                matched = [a for a in parsed if any(kw in a["text"] for kw in keywords)]
-                if matched:
-                    return matched[:12], True
-
-            return parsed[:10], False  # 키워드 매칭이 없으면 앞부분(총칙 등)으로 개요 제공
+            return _select_articles(parsed, keywords)
 
     except Exception:
         return [], False
@@ -253,14 +314,9 @@ async def get_admrul_articles(serial_no: str, keywords: list = None) -> tuple:
                 if not isinstance(text, str) or not text.strip():
                     continue
                 m = re.match(r"제(\d+)조", text)
-                parsed.append({"article_no": m.group(1) if m else "", "text": text[:300]})
+                parsed.append({"article_no": m.group(1) if m else "", "text": text.strip()})
 
-            if keywords:
-                matched = [a for a in parsed if any(kw in a["text"] for kw in keywords)]
-                if matched:
-                    return matched[:12], True
-
-            return parsed[:10], False
+            return _select_articles(parsed, keywords)
 
     except Exception:
         return [], False
