@@ -158,8 +158,7 @@ async def chat(req: ChatRequest):
     ask_model = MODEL_PROVIDERS.get(req.model, ask_nvidia)
 
     # 의도 파악 및 검색 키워드 정제 (선택된 모델로 수행)
-    search_query = await extract_search_keywords(req.message, ask_model)
-    search_terms = [t.strip() for t in search_query.split(",") if t.strip()] or [req.message]
+    search_terms, body_terms = await extract_search_keywords(req.message, ask_model)
 
     # 법령 키워드 유무와 무관하게 항상 조회를 시도한다.
     # (민법/상법 관련 질문 등은 "법", "조" 같은 키워드 없이도 들어올 수 있고,
@@ -170,7 +169,7 @@ async def chat(req: ChatRequest):
     # 질문자의 실제 의도(탈퇴, 동의 등)가 조문 선별에 반영된다.
     legal_basis, precedents = await asyncio.gather(
         _search_all_terms(
-            lambda term: search_and_fetch_law(term, req.message), search_terms
+            lambda term: search_and_fetch_law(term, req.message, body_terms), search_terms
         ),
         _search_first_hit(search_precedent, search_terms),
     )

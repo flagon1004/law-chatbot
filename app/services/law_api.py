@@ -100,6 +100,10 @@ def _select_articles(parsed: list, keywords: list) -> tuple:
                   for i, a in enumerate(parsed)]
         hits = sorted((s for s in scored if s[0] > 0), key=lambda s: (-s[0], s[1]))
         if hits:
+            # 일반 단어 하나만 우연히 걸린 약한 조문이 한도를 채우지 않도록,
+            # 최고 일치 수의 절반 미만인 조문은 버린다.
+            floor = max(1, (hits[0][0] + 1) // 2)
+            hits = [h for h in hits if h[0] >= floor]
             return [clip(a) for _, _, a in hits[:_MATCHED_LIMIT]], True
 
     return [clip(a) for a in parsed[:_OVERVIEW_LIMIT]], False
@@ -351,7 +355,8 @@ async def _search_and_fetch_admrul(law_query: str, keywords: list) -> tuple:
     return legal_basis, matched_any
 
 
-async def search_and_fetch_law(query: str, concept_text: str = None) -> list:
+async def search_and_fetch_law(query: str, concept_text: str = None,
+                               body_terms: list = None) -> list:
     """검색 → 상위 법령의 실제 조문까지 조회 (구조화된 리스트로 반환)
 
     반환 항목: {"law_name", "date", "article_no", "text"}
@@ -373,6 +378,11 @@ async def search_and_fetch_law(query: str, concept_text: str = None) -> list:
     try:
         law_query = _extract_law_query(query)
         keywords  = _extract_keywords(concept_text or query, law_query)
+        # intent.py가 일상어를 조문 본문에 실제 쓰이는 법령 용어로 바꾼 것
+        # (예: 음주운전 → 술에 취한 상태). 글자 매칭의 동의어 한계를 보완한다.
+        for term in body_terms or []:
+            if term not in keywords:
+                keywords.append(term)
 
         async with httpx.AsyncClient(timeout=8.0) as client:
             # 1단계: 법령 검색
