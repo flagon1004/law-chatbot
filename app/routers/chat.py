@@ -12,6 +12,7 @@ from app.services.law_api import (
     format_legal_basis, format_precedents,
 )
 from app.services.verifier import verify_citations
+from app.services.cautions import matched_cautions
 
 router = APIRouter()
 
@@ -106,6 +107,10 @@ def build_prompt(message: str, history: List[Message],
 
     if prec_context:
         parts.append(f"\n\n[법제처 실제 판례 — 아래 판례만 인용할 것]\n{prec_context}")
+
+    cautions = matched_cautions(message)
+    if cautions:
+        parts.append("\n\n[이 질문에 대한 주의사항]\n" + "\n".join(f"- {c}" for c in cautions))
 
     parts.append(f"\n\n사용자: {message}\n어시스턴트:")
     return "".join(parts)

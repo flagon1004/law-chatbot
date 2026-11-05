@@ -235,7 +235,7 @@ async def get_law_article(law_id: str, article: str) -> str:
 # 판례 목록 검색은 '사건명' 부분 일치다. 본문에서 판시사항·판결요지는 상세 조회
 # (lawService, ID=판례일련번호)로만 얻을 수 있다.
 _PREC_LIST_DISPLAY = 20      # 검색어당 목록 후보 수 (사건명이 '대여금'처럼 단순한 판결이 많아 넉넉히)
-_PREC_DETAIL_CANDIDATES = 12  # 상세 조회해서 관련도를 매길 후보 수
+_PREC_DETAIL_CANDIDATES = 10  # 상세 조회해서 관련도를 매길 후보 수
 _PREC_RESULT_LIMIT = 3
 _PREC_MIN_SCORE = 2          # 서로 다른 질문 키워드가 최소 이만큼 판시사항·사건명에 나와야 함
 _PREC_SUMMARY_LIMIT = 250
@@ -255,13 +255,17 @@ def _court_name(p: dict) -> str:
     return p.get("법원명") or (p.get("사건번호", "").split("-")[0] if "-" in p.get("사건번호", "") else "")
 
 
-async def _prec_list(client, term: str, supreme_only: bool) -> list:
+async def _prec_list(client, term: str, supreme_only: bool, body: bool = False) -> list:
     params = {
         "OC": _get_api_key(), "target": "prec", "type": "JSON",
         "query": term, "display": _PREC_LIST_DISPLAY, "page": 1,
     }
     if supreme_only:
         params["curt"] = "대법원"
+    if body:
+        # 사건명이 아니라 판결문 본문에서 검색한다(여러 단어는 모두 포함된 판결만).
+        # 사건명이 "대여금"처럼 단순한 판결들 중 쟁점이 맞는 것을 찾는 데 쓴다.
+        params["search"] = 2
     try:
         resp = await client.get(f"{LAW_API_BASE}/lawSearch.do", params=params)
         resp.raise_for_status()
@@ -289,15 +293,26 @@ def _is_bare_law(term: str) -> bool:
 
 
 async def _collect_precedents(terms: list, keywords: list) -> list:
+    # 본문 검색은 단어가 많을수록 우연히 겹치는 잡음이 늘고 무관한 판결이 걸리므로 2어절 검색어만 쓴다
+    body_terms = [t for t in terms if len(t.split()) == 2]
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # 검색어마다 대법원 한정 / 전체 두 번씩 병렬 조회
-        lists = await asyncio.gather(*[
-            _prec_list(client, t, supreme) for t in terms for supreme in (True, False)])
+        # 사건명 검색(대법원 한정 / 전체)과 본문 검색(대법원 한정, 여러 단어 검색어만)을 병렬 조회
+        title_sup, title_all, body_sup = await asyncio.gather(
+            asyncio.gather(*[_prec_list(client, t, True) for t in terms]),
+            asyncio.gather(*[_prec_list(client, t, False) for t in terms]),
+            asyncio.gather(*[_prec_list(client, t, True, body=True) for t in body_terms]),
+        )
+
+        def take(lists, per_list):
+            return [p for lst in lists for p in lst[:per_list]]
+
+        # 후보 구성: 사건명 일치 대법원 → 본문 일치 대법원 → 그 외(하급심 포함).
+        # 사건명 후보가 목록을 다 차지하지 않도록 그룹별로 상한을 둔다.
         candidates, seen = [], set()
-        # 대법원 판결을 검색어 우선순위대로 먼저, 그다음 나머지(하급심 포함)
-        ordered = [lists[i] for i in range(0, len(lists), 2)] +                   [lists[i] for i in range(1, len(lists), 2)]
-        for lst in ordered:
-            for p in lst:
+        body_hits = {p.get("사건번호", "") for lst in body_sup for p in lst[:4]}
+        groups = [take(title_sup, 5), take(body_sup, 4), take(title_all, 20)]
+        for group in groups:
+            for p in group:
                 num = p.get("사건번호", "")
                 if not num or num in seen:
                     continue
@@ -312,6 +327,8 @@ async def _collect_precedents(terms: list, keywords: list) -> list:
         holding_src = _clean_html(d.get("판시사항")) + " " + _clean_html(d.get("판결요지"))
         haystack = p.get("사건명", "") + " " + holding_src
         score = sum(1 for kw in keywords if kw and kw in haystack)
+        if score and p.get("사건번호") in body_hits:
+            score += 1   # 쟁점어가 판결문 본문에 함께 나온 판결
         supreme = _court_name(p) == "대법원"
         scored.append((score, supreme, order, p, d))
 
