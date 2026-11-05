@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 from difflib import SequenceMatcher
@@ -70,6 +71,48 @@ def _title_coverage(term: str, title: str) -> float:
         return 0.0
     match = SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
     return match.size / len(b)
+
+
+# 법령 제목 검색은 부분 일치라 "민법"이 "난민법"에도 걸리고, 결과도 그 순서로 온다.
+# 후보를 넉넉히 받아 아래 규칙으로 다시 고른다.
+# 실제 법령이 순위 하단에 밀리는 경우가 있어(예: "상법"은 제목에 '상법'이 들어간 다른 법들 뒤)
+# 후보를 최대치로 받는다.
+_LAW_SEARCH_DISPLAY = 50
+_LAW_PREFIX_MIN_COVERAGE = 0.25
+_LAW_SUFFIXES = ("시행령", "시행규칙")
+
+
+def _rank_law_candidates(term: str, laws: list, limit: int = 2) -> list:
+    """검색어에 해당하는 법령을 골라 최대 limit개 반환.
+
+    1) 제목이 검색어와 같거나(공백 무시) 그 시행령/시행규칙인 것만 우선한다.
+       ("민법" → 민법, "도로교통법" → 도로교통법·시행령)
+    2) 그런 게 없으면 제목이 검색어로 시작하는 것만, 제목 대비 일치 비중이 너무 낮으면 버린다."""
+    norm = lambda s: re.sub(r"\s+", "", s or "")
+    t = norm(term)
+    if not t:
+        return laws[:limit]
+
+    exact, related, prefix = [], [], []
+    for law in laws:
+        name = norm(law.get("법령명한글", ""))
+        if not name:
+            continue
+        if name == t:
+            exact.append(law)
+        elif any(name == t + suf for suf in _LAW_SUFFIXES):
+            related.append(law)
+        elif name.startswith(t):
+            prefix.append(law)
+
+    if exact or related:
+        return (exact + related)[:limit]
+
+    # 제목이 검색어로 시작하는 법령만 인정한다. 제목 중간에 검색어가 들어 있을 뿐인 법령
+    # ("손해배상" → "우주손해배상법")은 무관한 경우가 대부분이라 버린다.
+    fallback = [law for law in prefix
+                if _title_coverage(term, law.get("법령명한글", "")) >= _LAW_PREFIX_MIN_COVERAGE]
+    return fallback[:limit]
 
 
 def _flatten_text(value) -> str:
@@ -188,44 +231,134 @@ async def get_law_article(law_id: str, article: str) -> str:
     except Exception:
         return ""
 
-async def search_precedent(query: str) -> list:
-    """법제처 Open API로 실제 판례 검색 (최대 3개, 구조화된 리스트로 반환)"""
+# ── 판례 검색 ────────────────────────────────────────────────────────────
+# 판례 목록 검색은 '사건명' 부분 일치다. 본문에서 판시사항·판결요지는 상세 조회
+# (lawService, ID=판례일련번호)로만 얻을 수 있다.
+_PREC_LIST_DISPLAY = 20      # 검색어당 목록 후보 수 (사건명이 '대여금'처럼 단순한 판결이 많아 넉넉히)
+_PREC_DETAIL_CANDIDATES = 12  # 상세 조회해서 관련도를 매길 후보 수
+_PREC_RESULT_LIMIT = 3
+_PREC_MIN_SCORE = 2          # 서로 다른 질문 키워드가 최소 이만큼 판시사항·사건명에 나와야 함
+_PREC_SUMMARY_LIMIT = 250
+_PREC_HOLDING_LIMIT = 400
+# 검색어 전체가 법령명(민법, 도로교통법 등)인 경우. 사건명 검색에서는 그 법을 다룬
+# 아무 사건이나 걸리므로 구체 용어 검색이 실패했을 때만 마지막으로 쓴다.
+_BARE_LAW_TERM = re.compile(r"^[가-힣\s]{1,40}(?:법률|법령|시행령|시행규칙|법)$")
+
+
+def _clean_html(value) -> str:
+    text = re.sub(r"<br\s*/?>", " ", _flatten_text(value))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _court_name(p: dict) -> str:
+    # 일부 하급심은 법원명 필드가 비어 있고 사건번호 앞에 "서울동부지방법원-2020-…"로 온다
+    return p.get("법원명") or (p.get("사건번호", "").split("-")[0] if "-" in p.get("사건번호", "") else "")
+
+
+async def _prec_list(client, term: str, supreme_only: bool) -> list:
+    params = {
+        "OC": _get_api_key(), "target": "prec", "type": "JSON",
+        "query": term, "display": _PREC_LIST_DISPLAY, "page": 1,
+    }
+    if supreme_only:
+        params["curt"] = "대법원"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            params = {
-                "OC": _get_api_key(),
-                "target": "prec",      # 판례 검색
-                "type": "JSON",
-                "query": _extract_law_query(query),
-                "display": 3,
-                "page": 1,
-            }
-            resp = await client.get(f"{LAW_API_BASE}/lawSearch.do", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-            precs = _as_list(data.get("PrecSearch", {}).get("prec"))
-            if not precs:
-                return []
-
-            results = []
-            for p in precs[:3]:
-                num = p.get("사건번호", "")
-                if not num:
-                    continue
-                summary = p.get("판시사항", "")[:100] if p.get("판시사항") else ""
-                results.append({
-                    "court": p.get("법원명", ""),
-                    "date": p.get("선고일자", ""),
-                    "case_no": num,
-                    "case_name": p.get("사건명", ""),
-                    "summary": summary,
-                })
-
-            return results
-
+        resp = await client.get(f"{LAW_API_BASE}/lawSearch.do", params=params)
+        resp.raise_for_status()
+        return _as_list(resp.json().get("PrecSearch", {}).get("prec"))
     except Exception:
         return []
+
+
+async def _prec_detail(client, serial_no: str) -> dict:
+    """판시사항·판결요지 조회. 조회되지 않는 출처(일부 하급심)는 빈 dict."""
+    if not serial_no:
+        return {}
+    try:
+        resp = await client.get(f"{LAW_API_BASE}/lawService.do", params={
+            "OC": _get_api_key(), "target": "prec", "type": "JSON", "ID": serial_no})
+        resp.raise_for_status()
+        body = resp.json().get("PrecService")
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_bare_law(term: str) -> bool:
+    return bool(_BARE_LAW_TERM.match(term.strip()))
+
+
+async def _collect_precedents(terms: list, keywords: list) -> list:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # 검색어마다 대법원 한정 / 전체 두 번씩 병렬 조회
+        lists = await asyncio.gather(*[
+            _prec_list(client, t, supreme) for t in terms for supreme in (True, False)])
+        candidates, seen = [], set()
+        # 대법원 판결을 검색어 우선순위대로 먼저, 그다음 나머지(하급심 포함)
+        ordered = [lists[i] for i in range(0, len(lists), 2)] +                   [lists[i] for i in range(1, len(lists), 2)]
+        for lst in ordered:
+            for p in lst:
+                num = p.get("사건번호", "")
+                if not num or num in seen:
+                    continue
+                seen.add(num)
+                candidates.append(p)
+        candidates = candidates[:_PREC_DETAIL_CANDIDATES]
+        details = await asyncio.gather(*[
+            _prec_detail(client, p.get("판례일련번호", "")) for p in candidates])
+
+    scored = []
+    for order, (p, d) in enumerate(zip(candidates, details)):
+        holding_src = _clean_html(d.get("판시사항")) + " " + _clean_html(d.get("판결요지"))
+        haystack = p.get("사건명", "") + " " + holding_src
+        score = sum(1 for kw in keywords if kw and kw in haystack)
+        supreme = _court_name(p) == "대법원"
+        scored.append((score, supreme, order, p, d))
+
+    # 본문 관련도(키워드 일치 수) → 대법원 → 원래 순서
+    scored.sort(key=lambda x: (-x[0], not x[1], x[2]))
+    if keywords:
+        # 일반 단어 하나(예: "책임")만 우연히 걸린 판례는 무관한 것으로 보고 버린다.
+        # 무관한 판례를 보여주는 것보다 "찾지 못했다"가 낫다.
+        scored = [s for s in scored if s[0] >= _PREC_MIN_SCORE]
+
+    results = []
+    for _, _, _, p, d in scored[:_PREC_RESULT_LIMIT]:
+        issue = _clean_html(d.get("판시사항"))
+        holding = _clean_html(d.get("판결요지"))
+        results.append({
+            "court": _court_name(p),
+            "date": p.get("선고일자", ""),
+            "case_no": p.get("사건번호", ""),
+            "case_name": p.get("사건명", ""),
+            "summary": issue[:_PREC_SUMMARY_LIMIT],
+            "holding": holding[:_PREC_HOLDING_LIMIT],
+        })
+    return results
+
+
+async def search_precedents(terms: list, keywords: list = None) -> list:
+    """판례 검색. terms는 우선순위 순서의 후보 검색어.
+
+    법령명만으로 된 검색어는 구체 용어로 아무것도 못 찾았을 때만 쓴다.
+    후보는 대법원 판결을 우선 모으고, 판시사항·판결요지에 질문 키워드가
+    얼마나 나오는지로 관련도를 매겨 상위 3건을 반환한다."""
+    keywords = keywords or []
+    seen, concept, bare = set(), [], []
+    for t in terms:
+        t = t.strip()
+        if t and t not in seen:
+            seen.add(t)
+            (bare if _is_bare_law(t) else concept).append(t)
+    try:
+        for group in (concept, bare):
+            if group:
+                results = await _collect_precedents(group, keywords)
+                if results:
+                    return results
+    except Exception:
+        pass
+    return []
 
 
 def format_precedents(precedents: list) -> str:
@@ -237,11 +370,14 @@ def format_precedents(precedents: list) -> str:
     for p in precedents:
         line = f"[{p['court']} {p['date']} {p['case_no']}] {p['case_name']}"
         if p.get("summary"):
-            line += f" — {p['summary']}..."
+            line += f"\n  판시사항: {p['summary']}"
+        if p.get("holding"):
+            line += f"\n  판결요지: {p['holding']}"
         lines.append(line)
 
     return "\n".join(lines)
-    
+
+
 async def get_law_articles(law_id: str, keywords: list = None) -> tuple:
     """법령 ID로 실제 조문 전문 조회.
 
@@ -407,24 +543,32 @@ async def search_and_fetch_law(query: str, concept_text: str = None,
             if term not in keywords:
                 keywords.append(term)
 
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            # 1단계: 법령 검색
-            params = {
-                "OC": _get_api_key(),
-                "target": "law",
-                "type": "JSON",
-                "query": law_query,
-                "display": 2,
-            }
-            resp = await client.get(f"{LAW_API_BASE}/lawSearch.do", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            laws = _as_list(data.get("LawSearch", {}).get("law"))
+        # 1단계: 법령 검색 (후보 목록이 커서 동시 요청 시 간헐적으로 실패하므로 1회 재시도)
+        params = {
+            "OC": _get_api_key(),
+            "target": "law",
+            "type": "JSON",
+            "query": law_query,
+            "display": _LAW_SEARCH_DISPLAY,
+        }
+        data = {}
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=12.0) as client:
+                    resp = await client.get(f"{LAW_API_BASE}/lawSearch.do", params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                break
+            except Exception:
+                if attempt == 1:
+                    raise
+        laws = _rank_law_candidates(
+            law_query, _as_list(data.get("LawSearch", {}).get("law")))
 
         law_basis, law_matched = [], False
         if laws:
-            # 2단계: 상위 2개 법령의 조문 전문 조회 (키워드와 관련된 조문 우선)
-            for law in laws[:2]:
+            # 2단계: 고른 법령(최대 2개)의 조문 전문 조회 (키워드와 관련된 조문 우선)
+            for law in laws:
                 law_id   = law.get("법령ID", "")
                 law_name = law.get("법령명한글", "")
                 date     = law.get("시행일자", "")

@@ -229,7 +229,8 @@ function buildPrecedentBlock(precedents) {
     const item = document.createElement("div");
     item.className = "legal-basis-article";
     item.textContent = `[${p.court} ${p.date} ${p.case_no}] ${p.case_name}`
-      + (p.summary ? ` — ${p.summary}...` : "");
+      + (p.summary ? `\n판시사항: ${p.summary}` : "")
+      + (p.holding ? `\n판결요지: ${p.holding}` : "");
     box.appendChild(item);
   });
 

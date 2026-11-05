@@ -8,7 +8,7 @@ from app.services.intent import extract_search_keywords
 from app.services.gemini import ask_gemini
 from app.services.nvidia import ask_nvidia
 from app.services.law_api import (
-    search_and_fetch_law, search_precedent,
+    search_and_fetch_law, search_precedents, _extract_keywords,
     format_legal_basis, format_precedents,
 )
 from app.services.verifier import verify_citations
@@ -41,7 +41,13 @@ SYSTEM_PROMPT = """당신은 대한민국 법령 전문 AI 어시스턴트입니
 4. 판례번호, 선고일자, 법원명을 절대 임의로 생성하지 마세요.
 5. 모르는 내용은 추측하지 말고 법령 확인을 권고하세요.
 6. [법제처 법령 데이터]에 제공된 조문 원문은 화면에 별도로 표시되므로, 답변에 원문을 그대로 옮겨 적지 마세요.
-   대신 "제O조에 따르면 ~하다"처럼 조문 번호를 근거로 그 의미와 적용 결과를 해설·요약하세요."""
+   대신 "제O조에 따르면 ~하다"처럼 조문 번호를 근거로 그 의미와 적용 결과를 해설·요약하세요.
+7. 제공된 판례는 판시사항·판결요지를 근거로 "어떤 쟁점에서 법원이 어떻게 판단했는지"를 설명하되,
+   질문의 사실관계와 직접 관련 없는 판례는 인용하지 말고 그 사실을 밝히세요.
+
+[답변 구성] 질문에 맞게 아래 순서를 따르되, 제공된 근거로 뒷받침되지 않는 내용은 단정하지 마세요.
+① 핵심 쟁점 요약(1~2문장)  ② 관련 법령·판례 해설  ③ 입증책임과 필요한 증거(해당되는 경우)
+④ 실무상 대응 절차  ⑤ 한계와 전문가(변호사·법률구조공단 132) 상담 권고"""
 
 class Message(BaseModel):
     role: str
@@ -68,6 +74,7 @@ class PrecedentItem(BaseModel):
     case_no: str
     case_name: str
     summary: str = ""
+    holding: str = ""
 
 
 class ChatResponse(BaseModel):
@@ -102,17 +109,6 @@ def build_prompt(message: str, history: List[Message],
 
     parts.append(f"\n\n사용자: {message}\n어시스턴트:")
     return "".join(parts)
-
-
-async def _search_first_hit(search_fn, terms: List[str]):
-    """콤마로 분리된 후보 키워드를 하나씩 시도해 결과가 있는 첫 번째 것을 반환.
-    법제처 검색 API는 콤마로 묶인 다중 키워드 문자열은 매칭하지 못하고
-    (예: "금전소비대차, 대여금" -> 0건) 단일 키워드일 때만 매칭되기 때문."""
-    for term in terms:
-        result = await search_fn(term)
-        if result:
-            return result
-    return []
 
 
 async def _search_all_terms(search_fn, terms: List[str], cap: int = 40):
@@ -158,7 +154,7 @@ async def chat(req: ChatRequest):
     ask_model = MODEL_PROVIDERS.get(req.model, ask_nvidia)
 
     # 의도 파악 및 검색 키워드 정제 (선택된 모델로 수행)
-    search_terms, body_terms = await extract_search_keywords(req.message, ask_model)
+    search_terms, body_terms, prec_terms = await extract_search_keywords(req.message, ask_model)
 
     # 법령 키워드 유무와 무관하게 항상 조회를 시도한다.
     # (민법/상법 관련 질문 등은 "법", "조" 같은 키워드 없이도 들어올 수 있고,
@@ -167,11 +163,14 @@ async def chat(req: ChatRequest):
     # 질문 전체를 넘긴다 — term(법령명 등)은 "어느 문서를 검색할지"만 정하고,
     # "그 문서의 어느 조문이 관련 있는지"는 원본 질문의 핵심 단어로 걸러야
     # 질문자의 실제 의도(탈퇴, 동의 등)가 조문 선별에 반영된다.
+    # 판례는 판시사항·판결요지에 질문 키워드가 나오는 정도로 관련도를 매긴다
+    prec_keywords = _extract_keywords(req.message, "") + body_terms + [
+        w for t in prec_terms for w in t.split() if len(w) >= 2]
     legal_basis, precedents = await asyncio.gather(
         _search_all_terms(
             lambda term: search_and_fetch_law(term, req.message, body_terms), search_terms
         ),
-        _search_first_hit(search_precedent, search_terms),
+        search_precedents(prec_terms + search_terms, prec_keywords),
     )
     law_used = bool(legal_basis or precedents)
 
@@ -182,7 +181,7 @@ async def chat(req: ChatRequest):
     reply  = await ask_model(prompt)
 
     # 인용 검증 — 조문 번호 오류 탐지
-    reply = await verify_citations(reply, legal_basis)
+    reply = await verify_citations(reply, legal_basis, precedents)
 
     return ChatResponse(
         reply=reply,
