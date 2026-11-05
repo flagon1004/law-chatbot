@@ -1,5 +1,6 @@
 import os
 import re
+from difflib import SequenceMatcher
 import httpx
 from dotenv import load_dotenv
 
@@ -52,6 +53,23 @@ def _extract_keywords(message: str, law_query: str) -> list:
 
 def _get_api_key() -> str:
     return os.getenv("LAW_API_KEY", "demo")
+
+
+# 행정규칙 제목 검색은 일반 단어("보증금")도 긴 제목의 일부로 걸어버린다
+# (예: "보증금 반환" → "어구보증금의 이관방법…에 관한 고시"). 검색어가 결과 제목에서
+# 차지하는 비중(공통 부분 문자열 길이 / 제목 길이)이 이 값 미만이면 무관한 문서로 본다.
+# 실측: 실제 규칙명 질의는 0.40~1.00(공동계약운용요령 0.67, 표준품셈 0.40~0.50),
+# 일반 단어로 걸린 잡음은 0.06~0.24.
+_ADMRUL_MIN_COVERAGE = 0.4
+
+
+def _title_coverage(term: str, title: str) -> float:
+    strip = lambda s: re.sub(r"[\s()\[\]「」·,]", "", s)
+    a, b = strip(term), strip(title)
+    if not a or not b:
+        return 0.0
+    match = SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
+    return match.size / len(b)
 
 
 def _flatten_text(value) -> str:
@@ -283,7 +301,8 @@ async def search_admrul(query: str) -> list:
                 "target": "admrul",
                 "type": "JSON",
                 "query": query,
-                "display": 2,
+                # 제목 일치도로 거를 것이므로 후보를 넉넉히 받는다
+                "display": 5,
             }
             resp = await client.get(f"{LAW_API_BASE}/lawSearch.do", params=params)
             resp.raise_for_status()
@@ -330,6 +349,10 @@ async def _search_and_fetch_admrul(law_query: str, keywords: list) -> tuple:
     """Returns: (legal_basis, matched) — matched는 키워드와 실제 일치하는
     조문을 찾았는지 여부."""
     rules = await search_admrul(law_query)
+    # 검색어와 제목이 충분히 겹치는 것만 남기고, 일치도 높은 순으로 상위 2개
+    scored = [(_title_coverage(law_query, r.get("행정규칙명", "")), r) for r in rules]
+    rules = [r for c, r in sorted(scored, key=lambda x: -x[0])
+             if c >= _ADMRUL_MIN_COVERAGE]
     if not rules:
         return [], False
 
